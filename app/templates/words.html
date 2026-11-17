@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}全局敏感词表 · 公告档案{% endblock %}
+{% block content %}
+<h1>全局敏感词表</h1>
+<p class="meta">
+  全档案共用一份词表，按原文精确匹配遮盖标题与正文中的全部命中，重叠处合并。
+  词表为空时不能发布脱敏公开页；词表发生有效改动后，旧发布页立即失效，须按新词表重新发布。
+</p>
+
+{% if error %}<div class="banner err">{{ error }}</div>{% endif %}
+{% if saved == 'updated' %}
+<div class="banner">词表已保存并生效（当前版本 v{{ request.query_params.get('version') }}）。此前全部公开页已失效，需重新发布。</div>
+{% elif saved == 'unchanged' %}
+<div class="banner warn">提交的词表与当前词表内容一致，未产生有效改动，版本与既有发布页保持不变。</div>
+{% endif %}
+
+<div class="card">
+  <dl class="kv">
+    <dt>当前版本</dt><dd>v{{ word_list.version }}
+      <span class="meta">（更新于 {{ word_list.updated_at|ts }}）</span></dd>
+    <dt>词条数量</dt>
+    <dd>
+      {{ word_list.words|length }} 个
+      {% if not word_list.words %}<span class="pill retracted">词表为空：禁止发布</span>{% endif %}
+    </dd>
+  </dl>
+</div>
+
+<div class="card">
+  <form method="post" action="/words">
+    <label for="raw_words">敏感词（每行一个，自动去除首尾空白与重复行）</label>
+    <textarea id="raw_words" name="raw_words"
+              placeholder="例如：&#10;某市政工程管理处&#10;王某某&#10;13800000000">{% for w in word_list.words %}{{ w }}
+{% endfor %}</textarea>
+    <p style="margin-bottom:0">
+      <button type="submit">保存词表</button>
+      <span class="meta">最多 500 个词，每个不超过 200 字；保存空白内容即清空词表。</span>
+    </p>
+  </form>
+</div>
+{% endblock %}

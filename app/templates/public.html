@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{% block title %}公开信息（脱敏文本）{% endblock %}</title>
+<style>
+  body { margin:0; font:15px/1.7 "Noto Sans SC","PingFang SC",system-ui,sans-serif;
+         color:#1b2430; background:#f5f7f6; }
+  main { max-width:860px; margin:34px auto 80px; padding:0 24px; }
+  .sheet { background:#fff; border:1px solid #d8dee4; border-radius:10px;
+           padding:26px 30px; }
+  h1 { font-size:21px; margin:0 0 14px; }
+  .meta { color:#5f6d79; font-size:13.5px; }
+  pre.body { white-space:pre-wrap; font:inherit; background:#f5f7f6;
+             padding:16px 18px; border-radius:8px; border:1px solid #d8dee4; }
+  .notice { background:#fdf4e7; border:1px solid #e6c99d; color:#8a4b00;
+            border-radius:8px; padding:14px 18px; }
+  .masked { letter-spacing:1px; }
+  footer { color:#5f6d79; font-size:12.5px; text-align:center; margin-top:22px; }
+</style>
+</head>
+<body>
+<main>
+{% if reason == 'current' %}
+  <div class="sheet">
+    <p class="meta">公开信息 · 脱敏文本 · 词表版本 v{{ publication.word_list_version }}</p>
+    <h1 class="masked">{{ publication.masked_title }}</h1>
+    <p class="meta">
+      公告号 {{ publication.announcement_number }} · 修订 r{{ publication.revision }}
+      · 发布于 {{ publication.created_at[:19] | replace('T', ' ') }} UTC
+    </p>
+    <pre class="body masked">{{ publication.masked_body }}</pre>
+    <p class="meta">本页仅提供按当前全局敏感词表遮盖后的文字，不提供原件或附件入口。</p>
+  </div>
+{% elif reason == 'expired' %}
+  <div class="sheet">
+    <h1>该公开页已失效</h1>
+    <div class="notice">
+      <p style="margin:0 0 8px">本脱敏公开页所依据的敏感词表已更新（发布时为
+        v{{ publication.word_list_version }}，当前为
+        v{{ publication.current_word_list_version }}）。</p>
+      <p style="margin:0">按规定，旧脱敏文本不再对外提供。如需查看，请联系采购信息公开员按当前词表重新发布。</p>
+    </div>
+  </div>
+{% else %}
+  <div class="sheet">
+    <h1>公开页不存在</h1>
+    <div class="notice">
+      <p style="margin:0">链接无效或该脱敏公开页尚未发布。如需查看，请联系采购信息公开员。</p>
+    </div>
+  </div>
+{% endif %}
+<footer>本页内容经敏感词遮盖处理，仅提供脱敏文字</footer>
+</main>
+</body>
+</html>

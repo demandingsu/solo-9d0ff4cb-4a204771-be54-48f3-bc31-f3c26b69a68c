@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ record.announcement_number }} r{{ record.revision }} · 公告档案{% endblock %}
 {% block content %}
+{% if error %}<div class="banner err">{{ error }}</div>{% endif %}
 <p class="meta"><a href="/notice/{{ record.announcement_number|urlencode }}">← 返回公告 {{ record.announcement_number }}</a></p>
 <h1>存档版本 r{{ record.revision }}</h1>
 <p class="meta">
@@ -35,6 +36,52 @@
     <a href="/notice/{{ record.announcement_number|urlencode }}/version/{{ record.revision }}/attachment">
       下载本版附件</a>
   </p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">脱敏公开发布</h2>
+  <p class="meta">
+    按全局敏感词表（当前 <strong>v{{ word_list.version }}</strong>，
+    {{ word_list.words|length }} 个词）精确匹配遮盖本版标题与正文，
+    重叠命中合并；公开页只提供脱敏文字，不附原件或附件入口。
+  </p>
+  {% if not word_list.words %}
+    <div class="banner err" style="margin-bottom:10px">
+      敏感词表为空，按规定不得发布。请先到
+      <a href="/words">敏感词表</a> 页录入词条。
+    </div>
+  {% endif %}
+  <form method="post"
+        action="/notice/{{ record.announcement_number|urlencode }}/version/{{ record.revision }}/publish">
+    <button type="submit" {% if not word_list.words %}disabled{% endif %}>
+      按当前词表发布脱敏公开页
+    </button>
+    {% if word_list.words %}
+    <span class="meta">词表一旦有效改动，已发布页面立即失效，须按新词表重发。</span>
+    {% endif %}
+  </form>
+  {% if publications %}
+  <h2>本版发布记录</h2>
+  <table>
+    <thead><tr><th>词表版本</th><th>发布时间</th><th>状态</th><th>公开链接</th></tr></thead>
+    <tbody>
+    {% for p in publications %}
+      <tr>
+        <td>v{{ p.word_list_version }}</td>
+        <td class="meta">{{ p.created_at|ts }}</td>
+        <td>
+          {% if p.is_current %}<span class="pill current">当前有效</span>
+          {% else %}<span class="pill retracted">已失效</span>{% endif %}
+        </td>
+        <td>
+          {% if p.is_current %}<a href="/p/{{ p.token }}">在浏览器打开</a>
+          {% else %}<span class="meta">链接已停用，需重发</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
 </div>
 
 <h2>同公告其他版本</h2>

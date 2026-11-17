@@ -16,6 +16,8 @@ from typing import Iterable
 from .domain import (
     ArchiveStorageError,
     VersionRecord,
+    WordList,
+    WordListChangedError,
     utc_now_iso,
 )
 
@@ -63,6 +65,38 @@ CREATE TABLE IF NOT EXISTS capture_log (
     detail          TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
+
+-- One global sensitive-word list. Version only moves forward on effective
+-- changes; every effective change invalidates all previously published pages.
+CREATE TABLE IF NOT EXISTS word_list_state (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    version     INTEGER NOT NULL,
+    updated_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sensitive_words (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    word    TEXT NOT NULL UNIQUE
+);
+
+-- Immutable masked snapshots. A row is only readable publicly while
+-- word_list_version equals the single global word_list_state.version.
+CREATE TABLE IF NOT EXISTS publications (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    token               TEXT NOT NULL UNIQUE,
+    announcement_number TEXT NOT NULL,
+    revision            INTEGER NOT NULL,
+    word_list_version   INTEGER NOT NULL,
+    masked_title        TEXT NOT NULL,
+    masked_body         TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    FOREIGN KEY (announcement_number, revision)
+        REFERENCES versions (announcement_number, revision),
+    UNIQUE (announcement_number, revision)
+);
+
+CREATE INDEX IF NOT EXISTS publications_number_revision
+    ON publications (announcement_number, revision);
 """
 
 
@@ -408,6 +442,310 @@ class ArchiveStore:
             raise ArchiveStorageError(f"无法记录采集事件：{exc}") from exc
         finally:
             conn.close()
+
+    # ------------------------------------------------- sensitive word list
+
+    def get_word_list(self) -> WordList:
+        """Read the single global word list and its monotonically growing
+        version in one connection, so callers always see a consistent pair."""
+        conn = self._connect()
+        try:
+            state = conn.execute(
+                "SELECT version, updated_at FROM word_list_state WHERE id = 1"
+            ).fetchone()
+            if state is None:
+                words: tuple[str, ...] = ()
+                return WordList(version=0, updated_at=None, words=words)
+            rows = conn.execute(
+                "SELECT word FROM sensitive_words ORDER BY id"
+            ).fetchall()
+            words = tuple(row["word"] for row in rows)
+            return WordList(
+                version=state["version"],
+                updated_at=state["updated_at"],
+                words=words,
+            )
+        except sqlite3.Error as exc:
+            raise ArchiveStorageError(f"无法读取敏感词表：{exc}") from exc
+        finally:
+            conn.close()
+
+    def replace_word_list(self, words: list[str]) -> WordList:
+        """Atomically replace the whole global word list.
+
+        Returns the resulting list. When the normalized list is identical to
+        the stored one, this is a no-op (version unchanged, no invalidation).
+        Any failure rolls back so the previous usable list stays in place.
+        """
+        conn = self._connect()
+        now = utc_now_iso()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = tuple(
+                row["word"]
+                for row in conn.execute(
+                    "SELECT word FROM sensitive_words ORDER BY id"
+                )
+            )
+            state = conn.execute(
+                "SELECT version, updated_at FROM word_list_state WHERE id = 1"
+            ).fetchone()
+            current_version = state["version"] if state is not None else 0
+            new_words = tuple(words)
+
+            if set(existing) == set(new_words):
+                conn.execute("ROLLBACK")
+                return WordList(
+                    version=current_version,
+                    updated_at=state["updated_at"] if state is not None else None,
+                    words=existing,
+                )
+
+            new_version = current_version + 1
+            conn.execute("DELETE FROM sensitive_words")
+            if new_words:
+                conn.executemany(
+                    "INSERT INTO sensitive_words (word) VALUES (?)",
+                    [(word,) for word in new_words],
+                )
+            conn.execute(
+                """
+                INSERT INTO word_list_state (id, version, updated_at)
+                VALUES (1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    version = excluded.version,
+                    updated_at = excluded.updated_at
+                """,
+                (new_version, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO capture_log
+                    (announcement_number, outcome, revision, detail, created_at)
+                VALUES (NULL, 'word_list_changed', NULL, ?, ?)
+                """,
+                (
+                    f"敏感词表有效改动，版本 v{current_version} → v{new_version}"
+                    f"（{len(new_words)} 个词）；此前公开页全部失效。",
+                    now,
+                ),
+            )
+            conn.execute("COMMIT")
+            return WordList(version=new_version, updated_at=now, words=new_words)
+        except sqlite3.Error as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise ArchiveStorageError(f"敏感词表保存失败，旧词表保持不变：{exc}") from exc
+        finally:
+            conn.close()
+
+    # --------------------------------------------------------- publications
+
+    def create_publication(
+        self,
+        *,
+        announcement_number: str,
+        revision: int,
+        word_list_version: int,
+        masked_title: str,
+        masked_body: str,
+        token: str,
+    ) -> dict:
+        """Atomically bind a masked snapshot to the current word-list version.
+
+        Raises WordListChangedError when the list moved between the caller's
+        read and this write: no row is inserted and nothing is overwritten.
+        Re-publishing a revision replaces its row inside the same transaction,
+        which also swaps the token so the old link stops resolving.
+        """
+        conn = self._connect()
+        now = utc_now_iso()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            state = conn.execute(
+                "SELECT version FROM word_list_state WHERE id = 1"
+            ).fetchone()
+            current_version = state["version"] if state is not None else 0
+            if current_version != word_list_version:
+                conn.execute("ROLLBACK")
+                raise WordListChangedError(
+                    "敏感词表在发布过程中发生改动，本次按旧词表生成的脱敏文本"
+                    "未发布；请按当前词表重新发布。"
+                )
+
+            version_row = conn.execute(
+                "SELECT 1 FROM versions WHERE announcement_number = ? "
+                "AND revision = ?",
+                (announcement_number, revision),
+            ).fetchone()
+            if version_row is None:
+                conn.execute("ROLLBACK")
+                raise ArchiveStorageError("要发布的存档版本不存在。")
+
+            old = conn.execute(
+                "SELECT token FROM publications WHERE announcement_number = ? "
+                "AND revision = ?",
+                (announcement_number, revision),
+            ).fetchone()
+            if old is not None:
+                conn.execute(
+                    "DELETE FROM publications WHERE announcement_number = ? "
+                    "AND revision = ?",
+                    (announcement_number, revision),
+                )
+            conn.execute(
+                """
+                INSERT INTO publications (
+                    token, announcement_number, revision, word_list_version,
+                    masked_title, masked_body, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    announcement_number,
+                    revision,
+                    word_list_version,
+                    masked_title,
+                    masked_body,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO capture_log
+                    (announcement_number, outcome, revision, detail, created_at)
+                VALUES (?, 'published', ?, ?, ?)
+                """,
+                (
+                    announcement_number,
+                    revision,
+                    f"已按敏感词表 v{word_list_version} 发布 r{revision} 脱敏公开页。",
+                    now,
+                ),
+            )
+            conn.execute("COMMIT")
+            return self._fetch_publication(conn, token)  # type: ignore[arg-type]
+        except WordListChangedError:
+            raise
+        except sqlite3.Error as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise ArchiveStorageError(f"发布写入失败，此前状态保持不变：{exc}") from exc
+        finally:
+            conn.close()
+
+    def get_publication_by_token(self, token: str) -> dict | None:
+        """Return the publication plus current word-list version.
+
+        Both reads use one connection/snapshot. The caller decides validity by
+        comparing ``word_list_version`` with the current global version; a
+        mismatch means the page must be treated as invalid (410).
+        """
+        if not token or len(token) > 128:
+            return None
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM publications WHERE token = ?", (token,)
+            ).fetchone()
+            if row is None:
+                return None
+            publication = dict(row)
+            state = conn.execute(
+                "SELECT version FROM word_list_state WHERE id = 1"
+            ).fetchone()
+            publication["current_word_list_version"] = (
+                state["version"] if state is not None else 0
+            )
+            publication["is_current"] = (
+                publication["word_list_version"]
+                == publication["current_word_list_version"]
+            )
+            return publication
+        except sqlite3.Error as exc:
+            raise ArchiveStorageError(f"无法读取发布记录：{exc}") from exc
+        finally:
+            conn.close()
+
+    def list_publications(self) -> list[dict]:
+        conn = self._connect()
+        try:
+            state = conn.execute(
+                "SELECT version FROM word_list_state WHERE id = 1"
+            ).fetchone()
+            current_version = state["version"] if state is not None else 0
+            rows = conn.execute(
+                """
+                SELECT p.*, v.title AS original_title
+                FROM publications p
+                JOIN versions v
+                  ON v.announcement_number = p.announcement_number
+                 AND v.revision = p.revision
+                ORDER BY p.id DESC
+                """
+            ).fetchall()
+            publications = []
+            for row in rows:
+                item = dict(row)
+                item["is_current"] = (
+                    item["word_list_version"] == current_version
+                )
+                publications.append(item)
+            return publications
+        except sqlite3.Error as exc:
+            raise ArchiveStorageError(f"无法读取发布记录：{exc}") from exc
+        finally:
+            conn.close()
+
+    def list_publications_for_version(
+        self, number: str, revision: int
+    ) -> list[dict]:
+        conn = self._connect()
+        try:
+            state = conn.execute(
+                "SELECT version FROM word_list_state WHERE id = 1"
+            ).fetchone()
+            current_version = state["version"] if state is not None else 0
+            rows = conn.execute(
+                "SELECT * FROM publications WHERE announcement_number = ? "
+                "AND revision = ? ORDER BY id DESC",
+                (number, revision),
+            ).fetchall()
+            publications = []
+            for row in rows:
+                item = dict(row)
+                item["is_current"] = (
+                    item["word_list_version"] == current_version
+                )
+                publications.append(item)
+            return publications
+        except sqlite3.Error as exc:
+            raise ArchiveStorageError(f"无法读取发布记录：{exc}") from exc
+        finally:
+            conn.close()
+
+    def _fetch_publication(
+        self, conn: sqlite3.Connection, token: str
+    ) -> dict | None:
+        row = conn.execute(
+            "SELECT * FROM publications WHERE token = ?", (token,)
+        ).fetchone()
+        if row is None:
+            return None
+        publication = dict(row)
+        state = conn.execute(
+            "SELECT version FROM word_list_state WHERE id = 1"
+        ).fetchone()
+        current_version = state["version"] if state is not None else 0
+        publication["current_word_list_version"] = current_version
+        publication["is_current"] = (
+            publication["word_list_version"] == current_version
+        )
+        return publication
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> VersionRecord:

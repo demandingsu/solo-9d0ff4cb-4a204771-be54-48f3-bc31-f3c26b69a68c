@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}脱敏发布记录 · 公告档案{% endblock %}
+{% block content %}
+<h1>脱敏发布记录</h1>
+<p class="meta">
+  当前敏感词表版本 <strong>v{{ word_list.version }}</strong>
+  （{{ word_list.words|length }} 个词）。仅与当前词表版本一致的发布页可被外部访问；
+  其余页面已随词表改动失效，需重新发布。
+</p>
+
+{% if published %}
+<div class="banner">发布成功：下方“当前有效”记录中的公开链接可在浏览器打开，页面仅含脱敏文字，不附原件入口。</div>
+{% endif %}
+{% if error %}<div class="banner err">{{ error }}</div>{% endif %}
+
+{% if publications %}
+<div class="card" style="padding:4px 10px">
+<table>
+  <thead>
+    <tr>
+      <th>公告号 / 修订</th><th>脱敏标题</th><th>词表版本</th>
+      <th>发布时间</th><th>状态</th><th>公开链接</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for p in publications %}
+    <tr {% if not p.is_current %}class="stale"{% endif %}>
+      <td>
+        <a href="/notice/{{ p.announcement_number|urlencode }}/version/{{ p.revision }}">
+          {{ p.announcement_number }} · r{{ p.revision }}</a>
+      </td>
+      <td>{{ p.masked_title }}</td>
+      <td>v{{ p.word_list_version }}</td>
+      <td class="meta">{{ p.created_at|ts }}</td>
+      <td>
+        {% if p.is_current %}
+          <span class="pill current">当前有效</span>
+        {% else %}
+          <span class="pill retracted">已失效</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if p.is_current %}
+          <a href="/p/{{ p.token }}">/p/{{ p.token[:12] }}…</a>
+        {% else %}
+          <span class="meta">链接已停用</span>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">尚无脱敏发布。请先在某个存档版本页发布。</p>
+{% endif %}
+{% endblock %}

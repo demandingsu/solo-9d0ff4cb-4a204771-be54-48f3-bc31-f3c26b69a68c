@@ -13,11 +13,16 @@ from fastapi.templating import Jinja2Templates
 from .capture import CaptureService
 from .domain import (
     ArchiveStorageError,
+    EmptyWordListError,
     InvalidNumber,
+    PublicationTargetError,
     SourceError,
+    WordListChangedError,
+    WordListValidationError,
     format_bytes,
     format_timestamp,
 )
+from .redaction import PublicationService, parse_words
 from .source import HttpSourceClient
 from .store import ArchiveStore
 
@@ -43,6 +48,7 @@ def create_app(
         client=source_client,
     )
     service = CaptureService(store, source)
+    publication_service = PublicationService(store)
     templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
     templates.env.filters["bytes"] = format_bytes
     templates.env.filters["ts"] = format_timestamp
@@ -61,6 +67,7 @@ def create_app(
     app.state.store = store
     app.state.source = source
     app.state.service = service
+    app.state.publication_service = publication_service
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):
@@ -125,10 +132,124 @@ def create_app(
                 status_code=404,
             )
         all_versions = store.list_versions(number)
+        word_list = store.get_word_list()
         return templates.TemplateResponse(
             request,
             "version.html",
-            {"record": record, "versions": all_versions},
+            {
+                "record": record,
+                "versions": all_versions,
+                "word_list": word_list,
+                "publications": store.list_publications_for_version(
+                    number, revision
+                ),
+                "error": request.query_params.get("error"),
+            },
+        )
+
+    @app.post("/notice/{number}/version/{revision}/publish")
+    def publish(number: str, revision: int):
+        try:
+            publication = publication_service.publish(number, revision)
+        except PublicationTargetError as exc:
+            return _error_redirect(number, exc.message)
+        except (EmptyWordListError, WordListChangedError) as exc:
+            target = f"/notice/{quote(number, safe='')}/version/{revision}"
+            return RedirectResponse(
+                target + "?error=" + quote(exc.message, safe=""),
+                status_code=303,
+            )
+        except (ArchiveStorageError, WordListValidationError) as exc:
+            target = f"/notice/{quote(number, safe='')}/version/{revision}"
+            return RedirectResponse(
+                target + "?error=" + quote(exc.message, safe=""),
+                status_code=303,
+            )
+        return RedirectResponse(
+            "/publications?published=" + quote(publication["token"], safe=""),
+            status_code=303,
+        )
+
+    # ----------------------------------------------------- word list admin
+
+    @app.get("/words", response_class=HTMLResponse)
+    def words_page(request: Request):
+        word_list = store.get_word_list()
+        return templates.TemplateResponse(
+            request,
+            "words.html",
+            {
+                "word_list": word_list,
+                "saved": request.query_params.get("saved"),
+                "error": request.query_params.get("error"),
+            },
+        )
+
+    @app.post("/words")
+    def save_words(raw_words: str = Form("")):
+        try:
+            words = parse_words(raw_words)
+            before = store.get_word_list()
+            updated = store.replace_word_list(words)
+        except (WordListValidationError, ArchiveStorageError) as exc:
+            return RedirectResponse(
+                "/words?error=" + quote(exc.message, safe=""),
+                status_code=303,
+            )
+        if updated.version == before.version:
+            return RedirectResponse(
+                "/words?saved=unchanged", status_code=303
+            )
+        return RedirectResponse(
+            "/words?saved=updated&version=" + str(updated.version),
+            status_code=303,
+        )
+
+    # ------------------------------------------------ publication registry
+
+    @app.get("/publications", response_class=HTMLResponse)
+    def publications_page(request: Request):
+        word_list = store.get_word_list()
+        return templates.TemplateResponse(
+            request,
+            "publications.html",
+            {
+                "publications": store.list_publications(),
+                "word_list": word_list,
+                "published": request.query_params.get("published"),
+                "error": request.query_params.get("error"),
+            },
+        )
+
+    # --------------------------------------------- unauthenticated public page
+
+    @app.get("/p/{token}", response_class=HTMLResponse)
+    def public_page(request: Request, token: str):
+        publication = store.get_publication_by_token(token)
+        if publication is None:
+            return templates.TemplateResponse(
+                request,
+                "public.html",
+                {"publication": None, "reason": "missing"},
+                status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        if not publication["is_current"]:
+            # The word list changed after publication: the old masked text is
+            # no longer the complete result under the current list, so the
+            # page is invalid and no text is served from it.
+            return templates.TemplateResponse(
+                request,
+                "public.html",
+                {"publication": publication, "reason": "expired"},
+                status_code=410,
+                headers={"Cache-Control": "no-store"},
+            )
+        return templates.TemplateResponse(
+            request,
+            "public.html",
+            {"publication": publication, "reason": "current"},
+            headers={"Cache-Control": "no-store"},
         )
 
     @app.get("/notice/{number}/version/{revision}/attachment")

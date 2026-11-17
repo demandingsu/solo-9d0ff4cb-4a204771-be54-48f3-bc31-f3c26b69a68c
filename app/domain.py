@@ -55,6 +55,29 @@ class ArchiveStorageError(ArchiveError):
     pass
 
 
+class WordListValidationError(ArchiveError):
+    """The submitted sensitive-word list violates a size/shape constraint."""
+
+
+class EmptyWordListError(ArchiveError):
+    """Publishing is forbidden while the global word list is empty."""
+
+
+class WordListChangedError(ArchiveError):
+    """The word list moved between reading it and committing a publication."""
+
+
+class PublicationTargetError(ArchiveError):
+    """The requested archived revision does not exist."""
+
+
+@dataclass(frozen=True)
+class WordList:
+    version: int
+    updated_at: str | None
+    words: tuple[str, ...]
+
+
 def normalize_number(value: str) -> str:
     number = (value or "").strip()
     if not number or not NUMBER_RE.fullmatch(number):
